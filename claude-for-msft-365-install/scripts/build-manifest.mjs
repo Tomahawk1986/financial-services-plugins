@@ -46,6 +46,10 @@ const KEYS = {
   gateway_token: { pattern: /./, hint: "gateway API key", secret: true },
   gateway_auth_header: { pattern: /^(x-api-key|authorization)$/i, hint: "auth header scheme (default: x-api-key)" },
   gateway_api_format: { pattern: /^(anthropic|bedrock|vertex)$/i, hint: "anthropic | bedrock | vertex" },
+  gateway_auth_source: {
+    pattern: /^entra$/,
+    hint: "'entra' to use the Entra SSO access token as the gateway Bearer (no gateway_token needed); requires entra_scope",
+  },
   mcp_servers: { pattern: /^\[.*\]$/, hint: "JSON array of {url, label, headers?, discover?}" },
   inference_headers: { pattern: /^\{.*\}$/, hint: "JSON object of extra headers to attach to every model request" },
   bootstrap_url: { pattern: /^https:\/\//, hint: "HTTPS endpoint returning per-user config" },
@@ -67,6 +71,12 @@ const KEYS = {
     pattern: /\S/,
     hint: "scope(s) for your Entra-protected API, e.g. api://<your-app-guid>/.default — comma/space-separated list allowed, requires graph_client_id",
   },
+  graph_cloud: {
+    // The add-in rejects unrecognized values at load and falls back to global,
+    // so a typo here degrades to commercial endpoints — heed the warning.
+    pattern: /^(global|us-gov-high|us-gov-dod|china)$/,
+    hint: "Microsoft national cloud: global | us-gov-high | us-gov-dod | china — only for sovereign clouds; GCC-High and 21Vianet are also auto-detected at sign-in",
+  },
   allow_1p: {
     pattern: /^[01]$/,
     hint: "1 allows Claude.ai OAuth alongside 3P (default: locked when other keys present)",
@@ -77,7 +87,7 @@ const KEYS = {
   },
 };
 
-const NEEDS_ENTRA = ["aws_role_arn", "graph_client_id", "entra_scope"];
+const NEEDS_ENTRA = ["aws_role_arn", "graph_client_id", "entra_scope", "gateway_auth_source"];
 
 async function main() {
   const [host, out, ...pairs] = process.argv.slice(2);
@@ -91,9 +101,8 @@ async function main() {
     console.error("error: Amazon Bedrock (aws_role_arn/aws_region) is not currently supported for Outlook");
     process.exit(1);
   }
-  if (host !== "outlook" && pairs.some((p) => p.startsWith("graph_client_id="))) {
-    console.warn("note: graph_client_id only applies to Outlook; it has no effect in the office manifest");
-  }
+  // graph_client_id and graph_cloud apply to both manifests: in Outlook it steers Graph +
+  // Entra sign-in; in office it steers the Entra SSO authority.
 
   const params = new URLSearchParams();
   for (const p of pairs) {
@@ -119,6 +128,21 @@ async function main() {
   }
   if (params.has("entra_scope") && !params.has("graph_client_id")) {
     throw new Error("entra_scope requires graph_client_id (the scope is requested as your own Entra app, not the default)");
+  }
+  if (params.has("gateway_auth_source") && !params.has("entra_scope")) {
+    throw new Error(
+      "gateway_auth_source=entra requires entra_scope (the gateway Bearer must be audienced to your API, not Microsoft Graph)",
+    );
+  }
+  if (params.has("gateway_auth_source") && params.has("gateway_token")) {
+    console.warn("note: gateway_auth_source=entra supersedes gateway_token — drop gateway_token from this manifest");
+  }
+  // A non-global graph_cloud needs a BYO Entra app — Anthropic's multi-tenant
+  // app exists only in the commercial cloud, so the default client_id against
+  // a sovereign authority fails with an opaque AADSTS700016 at sign-in.
+  const cloud = params.get("graph_cloud");
+  if (cloud && cloud !== "global" && !params.has("graph_client_id")) {
+    throw new Error(`graph_cloud=${cloud} requires a graph_client_id registered in that cloud`);
   }
 
   // URLSearchParams joins with `&`; XML attribute values need it escaped.
